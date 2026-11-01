@@ -2,11 +2,9 @@ import argparse
 import logging
 import requests
 import feedparser
-import html2text
-from datetime import datetime
+from datetime import datetime, timezone
 from dateutil import parser
 import re
-import os
 import sys
 
 # Configure logging
@@ -48,7 +46,19 @@ def fetch_vulnerability_reports(url):
             logging.info(f"Fetching API data from: {url}")
             response = requests.get(url, timeout=10)
             response.raise_for_status()
-            return response.json()  # Assuming API returns JSON
+            data = response.json()
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                # Documented wrapper keys: an object wrapping the list of
+                # reports under one of these keys is unwrapped.
+                for key in ("results", "vulnerabilities", "entries", "reports", "items"):
+                    if isinstance(data.get(key), list):
+                        return data[key]
+                logging.error(f"API response from {url} is a JSON object with no list of reports under a known wrapper key (results, vulnerabilities, entries, reports, items); treating it as a fetch error.")
+                return None
+            logging.error(f"API response from {url} has an unsupported shape ({type(data).__name__}); treating it as a fetch error.")
+            return None
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching vulnerability reports from {url}: {e}")
         return None
@@ -89,30 +99,32 @@ def analyze_vulnerability_ages(reports, priority="High", keywords=None, max_age_
         max_age_days (int): Maximum age of vulnerabilities to consider (in days).
 
     Returns:
-        tuple: A tuple containing the average age (in days), maximum age (in days), and a list of high-priority vulnerabilities.  Returns (None, None, []) if there is an error.
+        tuple: A tuple containing the average age (in days), maximum age (in days), a list of high-priority vulnerabilities, and a stats dict counting future-dated entries excluded and entries skipped because their date could not be determined (naming the skipped entries). Returns (None, None, [], stats) when nothing matches.
     """
-    today = datetime.now()
+    today = datetime.now(timezone.utc)
     ages = []
     high_priority_vulnerabilities = []
+    stats = {"future_excluded": 0, "skipped": 0, "skipped_titles": []}
 
     if keywords:
         keywords_list = [k.strip().lower() for k in keywords.split(',')]
     else:
         keywords_list = []
 
-    try:
-        for report in reports:
-            # Extract information based on common fields in RSS/API data
-            title = report.get('title', '').lower()
-            description = report.get('description', '').lower()
+    for report in reports:
+        title_for_log = "unknown entry"
+        try:
+            if not hasattr(report, "get"):
+                stats["skipped"] += 1
+                stats["skipped_titles"].append(str(report)[:80])
+                logging.warning(f"Skipping entry that is not a report object: {str(report)[:80]}")
+                continue
+            title_for_log = str(report.get('title', 'N/A'))
+            title = str(report.get('title', '')).lower()
+            description = str(report.get('description', '')).lower()
             link = report.get('link', '')
             published_date = None
 
-            # Prioritize 'published' or 'pubDate' if available, otherwise try to extract from description
-            # The elif chain matters: a report whose published value
-            # is present but unparsable never falls through to pubDate,
-            # because the first branch was taken. It goes to the regex
-            # attempt or is skipped, even when pubDate held a good date.
             if 'published' in report:
                 try:
                     published_date = parser.parse(report['published'])
@@ -126,20 +138,13 @@ def analyze_vulnerability_ages(reports, priority="High", keywords=None, max_age_
                     logging.warning(f"Failed to parse 'pubDate' date: {e}")
                     published_date = None
 
-            # If published date is still None, attempt to extract from the description using regex
             if published_date is None and date_regex:
                 published_date = extract_date_from_description(description, date_regex)
 
-
-            # A timezone aware parsed date against naive today raises
-            # inside the subtraction, and the outer handler then returns
-            # no result at all, discarding every report already aged.
-            # A future date gives a negative age, which passes the
-            # maximum age filter below and pulls the average down.
-            if published_date:
-                age = (today - published_date).days
-            else:
-                logging.warning(f"Could not determine the date for vulnerability {title}. Skipping.")
+            if published_date is None:
+                stats["skipped"] += 1
+                stats["skipped_titles"].append(title_for_log)
+                logging.warning(f"Could not determine the date for vulnerability {title_for_log}. Skipping this entry.")
                 continue
 
             # Filter based on priority and keywords
@@ -148,29 +153,46 @@ def analyze_vulnerability_ages(reports, priority="High", keywords=None, max_age_
             # counts the report as high priority, and a report whose
             # feed stores priority in its own field is only found when
             # the word also appears in the title or description.
-            if priority.lower() in title or priority.lower() in description:
-                if not keywords_list or any(keyword in description for keyword in keywords_list) or any(keyword in title for keyword in keywords_list):
-                    if age <= max_age_days:
-                        ages.append(age)
-                        high_priority_vulnerabilities.append({
-                            'title': report.get('title', 'N/A'),
-                            'description': report.get('description', 'N/A'),
-                            'link': link,
-                            'age': age,
-                            'published_date': published_date.strftime("%Y-%m-%d") if published_date else "N/A"
-                        })
-        if ages:
-            average_age = sum(ages) / len(ages)
-            max_age = max(ages)
-            return average_age, max_age, high_priority_vulnerabilities
-        else:
-            logging.info("No vulnerabilities found matching the criteria.")
-            return None, None, []
-    except Exception as e:
-        logging.error(f"An error occurred during vulnerability analysis: {e}")
-        return None, None, []
+            if priority.lower() not in title and priority.lower() not in description:
+                continue
+            if keywords_list and not any(keyword in description for keyword in keywords_list) and not any(keyword in title for keyword in keywords_list):
+                continue
 
-def generate_report(average_age, max_age, vulnerabilities, output_path=None):
+            # Normalize to a single basis: aware dates are converted to
+            # UTC and naive dates are taken as UTC, so the subtraction
+            # against the aware UTC now cannot raise a TypeError.
+            if published_date.tzinfo is None:
+                published_utc = published_date.replace(tzinfo=timezone.utc)
+            else:
+                published_utc = published_date.astimezone(timezone.utc)
+            age = (today - published_utc).days
+            if age < 0:
+                stats["future_excluded"] += 1
+                logging.warning(f"Excluding future-dated entry {title_for_log} (age {age} days).")
+                continue
+            if age <= max_age_days:
+                ages.append(age)
+                high_priority_vulnerabilities.append({
+                    'title': report.get('title', 'N/A'),
+                    'description': report.get('description', 'N/A'),
+                    'link': link,
+                    'age': age,
+                    'published_date': published_utc.strftime("%Y-%m-%d")
+                })
+        except Exception as e:
+            stats["skipped"] += 1
+            stats["skipped_titles"].append(title_for_log)
+            logging.warning(f"Skipping entry {title_for_log} after an error: {e}")
+            continue
+
+    if ages:
+        average_age = sum(ages) / len(ages)
+        max_age = max(ages)
+        return average_age, max_age, high_priority_vulnerabilities, stats
+    logging.info("No vulnerabilities found matching the criteria.")
+    return None, None, [], stats
+
+def generate_report(average_age, max_age, vulnerabilities, output_path=None, stats=None):
     """
     Generates a report summarizing the vulnerability analysis.
 
@@ -189,6 +211,12 @@ def generate_report(average_age, max_age, vulnerabilities, output_path=None):
     High-Priority Vulnerabilities:
     ------------------------------
     """
+    if stats:
+        report += f"Future-dated entries excluded: {stats.get('future_excluded', 0)}\n"
+        report += f"Entries skipped (date could not be determined): {stats.get('skipped', 0)}\n"
+        for skipped_title in stats.get('skipped_titles', []):
+            report += f"Skipped entry: {skipped_title}\n"
+        report += "\n"
     if not vulnerabilities:
         report += "No High-Priority Vulnerabilities Found.\n"
     else:
@@ -211,6 +239,25 @@ def generate_report(average_age, max_age, vulnerabilities, output_path=None):
         except Exception as e:
             logging.error(f"Error saving report to {output_path}: {e}")
 
+def generate_no_matches_report(stats, output_path=None):
+    """Write a report that states plainly that no entries matched."""
+    report = "Vulnerability Analysis Report\n------------------------------\nStatus: No matches. No vulnerabilities matched the criteria, so no age statistics were computed.\n"
+    if stats:
+        report += f"Future-dated entries excluded: {stats.get('future_excluded', 0)}\n"
+        report += f"Entries skipped (date could not be determined): {stats.get('skipped', 0)}\n"
+        for skipped_title in stats.get('skipped_titles', []):
+            report += f"Skipped entry: {skipped_title}\n"
+    print(report)
+    if output_path:
+        try:
+            with open(output_path, "w") as f:
+                f.write(report)
+            logging.info(f"Report saved to: {output_path}")
+        except Exception as e:
+            logging.error(f"Error saving report to {output_path}: {e}")
+    return report
+
+
 def main():
     """
     Main function to orchestrate the vulnerability analysis.
@@ -226,12 +273,16 @@ def main():
     if reports is None:
         sys.exit(1) # Exit if no reports are fetched.
 
-    average_age, max_age, vulnerabilities = analyze_vulnerability_ages(reports, args.priority, args.keywords, args.days, args.regex)
+    average_age, max_age, vulnerabilities, stats = analyze_vulnerability_ages(reports, args.priority, args.keywords, args.days, args.regex)
 
     if average_age is not None and max_age is not None:
-         generate_report(average_age, max_age, vulnerabilities, args.output)
+         generate_report(average_age, max_age, vulnerabilities, args.output, stats)
     else:
-        logging.warning("No report generated due to missing analysis data.")
+        generate_no_matches_report(stats, args.output)
+        if stats.get("skipped"):
+            logging.error(f"Analysis incomplete: {stats['skipped']} entry or entries could not be dated: {', '.join(stats['skipped_titles'])}")
+        logging.warning("No matching vulnerabilities: exiting non-zero so zero matching work is not reported as a completed analysis.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
