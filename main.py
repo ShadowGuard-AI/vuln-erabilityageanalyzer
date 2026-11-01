@@ -109,6 +109,10 @@ def analyze_vulnerability_ages(reports, priority="High", keywords=None, max_age_
             published_date = None
 
             # Prioritize 'published' or 'pubDate' if available, otherwise try to extract from description
+            # The elif chain matters: a report whose published value
+            # is present but unparsable never falls through to pubDate,
+            # because the first branch was taken. It goes to the regex
+            # attempt or is skipped, even when pubDate held a good date.
             if 'published' in report:
                 try:
                     published_date = parser.parse(report['published'])
@@ -127,6 +131,11 @@ def analyze_vulnerability_ages(reports, priority="High", keywords=None, max_age_
                 published_date = extract_date_from_description(description, date_regex)
 
 
+            # A timezone aware parsed date against naive today raises
+            # inside the subtraction, and the outer handler then returns
+            # no result at all, discarding every report already aged.
+            # A future date gives a negative age, which passes the
+            # maximum age filter below and pulls the average down.
             if published_date:
                 age = (today - published_date).days
             else:
@@ -134,6 +143,11 @@ def analyze_vulnerability_ages(reports, priority="High", keywords=None, max_age_
                 continue
 
             # Filter based on priority and keywords
+            # Priority is a substring test, not a field. The word high
+            # inside another word, or a passing mention in the text,
+            # counts the report as high priority, and a report whose
+            # feed stores priority in its own field is only found when
+            # the word also appears in the title or description.
             if priority.lower() in title or priority.lower() in description:
                 if not keywords_list or any(keyword in description for keyword in keywords_list) or any(keyword in title for keyword in keywords_list):
                     if age <= max_age_days:
