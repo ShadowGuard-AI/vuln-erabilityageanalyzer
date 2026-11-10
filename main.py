@@ -88,6 +88,22 @@ def extract_date_from_description(description, regex):
             logging.warning(f"Failed to extract date using regex: {e}")
             return None
 
+def priority_matches(report, title, description, priority):
+    """Decide whether a report matches the requested priority.
+
+    A priority or severity field stored on the report itself is checked
+    first and decides alone when present. Without such a field, the
+    priority must appear as a whole word in the title or description.
+    """
+    wanted = str(priority).strip().lower()
+    if not wanted:
+        return True
+    for field in ("priority", "severity"):
+        value = report.get(field)
+        if value is not None and str(value).strip() != "":
+            return str(value).strip().lower() == wanted
+    return re.search(r"\b" + re.escape(wanted) + r"\b", title + " " + description) is not None
+
 def analyze_vulnerability_ages(reports, priority="High", keywords=None, max_age_days=365, date_regex=None):
     """
     Analyzes vulnerability reports and calculates the average and maximum age.
@@ -121,25 +137,35 @@ def analyze_vulnerability_ages(reports, priority="High", keywords=None, max_age_
                 continue
             title_for_log = str(report.get('title', 'N/A'))
             title = str(report.get('title', '')).lower()
-            description = str(report.get('description', '')).lower()
+            # RSS entries commonly carry their body in 'summary', not
+            # 'description'; fall back to it so keyword, priority, and
+            # date-regex checks see the actual text.
+            raw_description = str(report.get('description') or report.get('summary') or '')
+            description = raw_description.lower()
             link = report.get('link', '')
             published_date = None
 
-            if 'published' in report:
+            for date_key in ('published', 'pubDate', 'updated', 'date'):
+                if report.get(date_key):
+                    try:
+                        published_date = parser.parse(str(report[date_key]))
+                    except Exception as e:
+                        logging.warning(f"Failed to parse '{date_key}' date: {e}")
+                        published_date = None
+                    if published_date is not None:
+                        break
+            if published_date is None and report.get('published_parsed'):
                 try:
-                    published_date = parser.parse(report['published'])
+                    import time as _time
+                    published_date = datetime.fromtimestamp(_time.mktime(report['published_parsed']), tz=timezone.utc)
                 except Exception as e:
-                    logging.warning(f"Failed to parse 'published' date: {e}")
-                    published_date = None
-            elif 'pubDate' in report:
-                try:
-                    published_date = parser.parse(report['pubDate'])
-                except Exception as e:
-                    logging.warning(f"Failed to parse 'pubDate' date: {e}")
+                    logging.warning(f"Failed to use 'published_parsed' date: {e}")
                     published_date = None
 
             if published_date is None and date_regex:
-                published_date = extract_date_from_description(description, date_regex)
+                # The regex runs on the original text, not the lowercased
+                # copy, so case sensitive patterns and month names work.
+                published_date = extract_date_from_description(raw_description, date_regex)
 
             if published_date is None:
                 stats["skipped"] += 1
@@ -147,13 +173,12 @@ def analyze_vulnerability_ages(reports, priority="High", keywords=None, max_age_
                 logging.warning(f"Could not determine the date for vulnerability {title_for_log}. Skipping this entry.")
                 continue
 
-            # Filter based on priority and keywords
-            # Priority is a substring test, not a field. The word high
-            # inside another word, or a passing mention in the text,
-            # counts the report as high priority, and a report whose
-            # feed stores priority in its own field is only found when
-            # the word also appears in the title or description.
-            if priority.lower() not in title and priority.lower() not in description:
+            # Filter based on priority and keywords. A dedicated
+            # priority or severity field, when the feed provides one,
+            # decides on its own. Otherwise the priority word must
+            # appear as a whole word in the title or description, so
+            # 'high' inside 'highlight' does not count.
+            if not priority_matches(report, title, description, priority):
                 continue
             if keywords_list and not any(keyword in description for keyword in keywords_list) and not any(keyword in title for keyword in keywords_list):
                 continue
